@@ -1,25 +1,26 @@
 # Spec: Remote Journal on Cloudflare Workers
 
-Status: **Draft for review** — sections marked **[OPEN]** need a decision before implementation starts.
-Scope: add a Cloudflare Worker deployment of this MCP server that stores entries in a Cloudflare
-database and serves a small web UI, authenticated with a static token.
+Status: **Agreed** — all blocking design questions are decided (§14). Ready to implement.
+Scope: add a Cloudflare Worker deployment of this MCP server that stores entries in D1 and serves a
+small web UI, authenticated with a token.
 
 ## 1. Goals
 
 1. Run the private journal as a **remote MCP server** on Cloudflare Workers, speaking the current
    MCP standard (protocol revision `2026-07-28`, Streamable HTTP transport).
-2. Persist entries in a **Cloudflare database** (D1) instead of the local filesystem, so journals are
-   shared across every machine/agent session that has the token.
-3. Serve a **minimal web UI** from the same Worker to browse, read and search entries.
-4. Authenticate both surfaces with a **static bearer token** — no OAuth provider, no user accounts.
+2. Persist entries in **D1** instead of the local filesystem, so journals are shared across every
+   machine and agent session that has the token.
+3. Serve a **minimal web UI** from the same Worker to browse, read, search and delete entries.
+4. Authenticate both surfaces with a **token**, with a spec-conformant OAuth layer on top so
+   one-click connector flows work.
 5. Keep the existing local stdio server working unchanged.
 
 ### Non-goals
 
-- Multi-user accounts, roles, sharing, or per-entry ACLs.
-- Real-time collaboration / websockets.
-- Replacing the local file-based mode.
-- Rich editor UI. The UI is primarily a reader.
+- Multi-user accounts, roles, sharing, per-entry ACLs.
+- Semantic/vector search on the Worker (see §6).
+- Migrating existing local journal entries (see §11).
+- A rich editor. The UI is a reader with a delete button.
 
 ## 2. Background: what exists today
 
@@ -28,14 +29,14 @@ database and serves a small web UI, authenticated with a static token.
 | `src/index.ts` | CLI entry, path resolution, starts the server |
 | `src/server.ts` | MCP server over stdio, 5 tools |
 | `src/journal.ts` | Writes `YYYY-MM-DD/HH-MM-SS-µµµµµµ.md` with YAML frontmatter |
-| `src/embeddings.ts` | `@xenova/transformers` (all-MiniLM-L6-v2, 384 dims), `.embedding` sidecar files |
+| `src/embeddings.ts` | `@xenova/transformers` (all-MiniLM-L6-v2, 384 dims), `.embedding` sidecars |
 | `src/search.ts` | Loads every `.embedding` into memory, cosine similarity, excerpts |
 | `src/paths.ts` | CWD → HOME → temp fallback, `PRIVATE_JOURNAL_PATH` override |
 
 Tools exposed today: `process_thoughts`, `search_journal`, `read_journal_entry`,
 `list_recent_entries`, `read_recent_entries`.
 
-Two storage scopes exist and are derived from the **filesystem**:
+Two storage scopes exist, derived from the **filesystem**:
 
 - **project** — `.private-journal/` next to the code. Receives only `project_notes`.
 - **user** — `~/.private-journal/`. Receives `reflections`, `observations`, `user_context`,
@@ -43,59 +44,58 @@ Two storage scopes exist and are derived from the **filesystem**:
 
 Constraints this creates for a Worker port:
 
-- `@xenova/transformers` cannot run on Workers (native ONNX runtime, filesystem cache). Semantic
-  search must be re-implemented with Workers AI + Vectorize, or dropped.
+- `@xenova/transformers` cannot run on Workers (native ONNX runtime, filesystem model cache).
 - There is no CWD on a Worker, so the project/user split can no longer be inferred from the
-  environment. It has to be carried in the protocol. See §7.
-- The current SDK dependency (`@modelcontextprotocol/sdk@^0.4.0`) predates Streamable HTTP. The
-  Worker will use `@modelcontextprotocol/server@2.0.0` — the local server can be migrated later.
+  environment; it has to be carried in the protocol. See §7.
+- `@modelcontextprotocol/sdk@^0.4.0` predates Streamable HTTP. The Worker uses
+  `@modelcontextprotocol/server@2.0.0`; the local server keeps its old SDK for now.
 
-## 3. High-level architecture
+## 3. Architecture
 
 ```
-                    Authorization: Bearer <token>
-Claude Code / Desktop ──────────────► POST /mcp   ┐
-                                                  │
-Browser ──── cookie (HMAC session) ──► GET  /     ├── Cloudflare Worker (Hono)
-                                        /entries/:id                │
-                                        /search                     │
-                                                                    ├─► D1  (entries, sections, FTS5)
-                                                                    ├─► Vectorize (optional, §6)
-                                                                    └─► Workers AI (optional, §6)
+Claude Code / Desktop ──── Bearer token ────► POST /mcp        ┐
+Connector clients ──────── OAuth 2.1 ───────► /oauth/*         │
+Browser ────────────────── session cookie ──► /, /entries/:id  ├─ Worker (Hono)
+                                              /search          │
+                                                               └─► D1
 ```
 
-One Worker, one D1 database, one domain. The MCP endpoint and the UI share the same auth secret and
-the same storage layer; only the presentation differs.
+One Worker, one D1 database, one `*.workers.dev` hostname. MCP endpoint, OAuth endpoints and UI
+share the same secret material and the same storage layer; only the presentation differs. No
+Durable Objects, no KV, no Vectorize, no Workers AI — D1 is the only stateful binding.
 
-### Proposed repo layout
+### Repo layout
 
 ```
 worker/
   wrangler.jsonc
   package.json            # own deps: hono, @modelcontextprotocol/server, agents
-  migrations/0001_init.sql
+  migrations/
+    0001_init.sql
   src/
-    index.ts              # Hono app, routing, auth middleware
+    index.ts              # Hono app, routing, security headers
     mcp.ts                # MCP server definition + tool handlers
-    store.ts              # D1 data access (the only place that writes SQL)
-    search.ts             # FTS5 + optional vector search, rank fusion
-    entry.ts              # section names, markdown rendering, excerpt (mirrors src/journal.ts)
+    auth/
+      tokens.ts           # static token list, constant-time compare
+      oauth.ts            # authorization server (§8.2)
+      session.ts          # signed cookie for the UI
+    store.ts              # D1 data access — the only place that writes SQL
+    search.ts             # FTS5 query building and ranking
+    entry.ts              # section names, markdown rendering, excerpts
     ui/                   # server-rendered HTML, inline CSS
   test/                   # vitest + @cloudflare/vitest-pool-workers
-scripts/
-  import-local-journal.ts # one-off migration of existing .private-journal dirs
 ```
 
-The root package (local stdio server) stays as it is. `worker/entry.ts` re-implements the ~60 lines
-of pure formatting logic rather than importing Node-flavoured modules; a parity test asserts the
-Worker renders byte-identical markdown to `JournalManager.formatThoughts`. **[OPEN — Q2]** the
-alternative is converting the repo to npm workspaces with a shared, dependency-free `core` package.
+The root package is untouched: no workspace conversion, no changes to `src/`, `tests/`,
+`jest.config.cjs` or the root `package.json`. `worker/src/entry.ts` re-implements the pure
+formatting logic from `src/journal.ts` rather than importing Node-flavoured modules; a parity test
+(§12) asserts both render byte-identical markdown, so the duplication cannot drift silently.
 
 ## 4. Data model (D1)
 
 ```sql
 CREATE TABLE entries (
-  id           TEXT PRIMARY KEY,     -- ULID: sortable by creation time
+  id           TEXT PRIMARY KEY,     -- ULID: lexicographically sortable by creation time
   created_at   INTEGER NOT NULL,     -- unix epoch ms, UTC
   local_date   TEXT    NOT NULL,     -- 'YYYY-MM-DD' in JOURNAL_TZ, for day grouping
   scope        TEXT    NOT NULL,     -- 'project' | 'user'
@@ -105,8 +105,8 @@ CREATE TABLE entries (
   client_label TEXT,                 -- which token wrote this
   created_tz   TEXT    NOT NULL      -- IANA tz used to derive local_date
 );
-CREATE INDEX idx_entries_created  ON entries(created_at DESC);
-CREATE INDEX idx_entries_scope    ON entries(scope, project, created_at DESC);
+CREATE INDEX idx_entries_created ON entries(created_at DESC);
+CREATE INDEX idx_entries_scope   ON entries(scope, project, created_at DESC);
 
 CREATE TABLE entry_sections (
   entry_id  TEXT    NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
@@ -119,26 +119,32 @@ CREATE INDEX idx_sections_section ON entry_sections(section);
 
 CREATE VIRTUAL TABLE entries_fts USING fts5(
   body,
-  content='entries', content_rowid='rowid'
-);  -- kept in sync by AFTER INSERT/UPDATE/DELETE triggers
+  content='entries',
+  content_rowid='rowid',
+  tokenize='porter unicode61 remove_diacritics 2'
+);
+-- kept in sync by AFTER INSERT / UPDATE / DELETE triggers on entries
 ```
 
 Notes:
 
-- **Sections are stored both ways**: normalised in `entry_sections` (for section filters, which the
-  current `search_journal` supports) and rendered into `entries.body` (what gets returned to the
-  model and displayed). Rendering stays the single source of truth for display.
-- Frontmatter is *not* stored; it is regenerated on read so the MCP output matches the local server.
-- 2 MB row limit and 500 MB DB (free) / 10 GB (paid) are far beyond realistic journal volume.
-- `id` is a ULID, not a path. See §7 for the `read_journal_entry` compatibility story.
+- **Sections are stored twice on purpose**: normalised in `entry_sections` (so the existing
+  `sections` filter of `search_journal` keeps working as a SQL join) and rendered into
+  `entries.body` (what the model reads and the UI displays).
+- Frontmatter is not stored; it is regenerated on read so MCP output matches the local server.
+- `porter unicode61 remove_diacritics 2` gives English stemming and accent-insensitive matching.
+- Row limit (2 MB) and database size (500 MB free / 10 GB paid) are far beyond realistic volume.
+- `id` is a ULID, not a path. See §5 for the `read_journal_entry` compatibility story.
+
+Additional tables for OAuth state are defined in §8.2.
 
 ## 5. MCP surface
 
-Endpoint: `POST /mcp` (Streamable HTTP, stateless — no Durable Objects, no SSE endpoint).
-Built with `createMcpHandler` from `agents/mcp/server` + `McpServer` from
-`@modelcontextprotocol/server@2.0.0`, which covers protocol revision `2026-07-28` (including
-`server/discover` and `_meta`-based version negotiation) and remains backward compatible with the
-older `initialize` handshake revisions.
+Endpoint: `POST /mcp` — Streamable HTTP, **stateless** (no session id, no SSE endpoint, no Durable
+Objects). Built with `createMcpHandler` from `agents/mcp/server` plus `McpServer` from
+`@modelcontextprotocol/server@2.0.0`, which implements revision `2026-07-28` (including
+`server/discover` and `_meta`-based version negotiation) and stays backward compatible with the
+older `initialize`-handshake revisions.
 
 Tool names, descriptions and argument shapes stay **identical** to the local server, so no prompt or
 CLAUDE.md guidance has to change:
@@ -146,157 +152,238 @@ CLAUDE.md guidance has to change:
 | Tool | Change on the Worker |
 | --- | --- |
 | `process_thoughts` | Adds optional `project` argument (§7). Writes 1–2 rows instead of 1–2 files. |
-| `search_journal` | Same args (`query`, `limit`, `type`, `sections`). Backend per §6. |
-| `read_journal_entry` | `path` now accepts an entry id or `journal://entry/<id>`; legacy filesystem paths are rejected with a clear error. |
-| `list_recent_entries` | Same args. SQL `ORDER BY created_at DESC`. |
+| `search_journal` | Same args (`query`, `limit`, `type`, `sections`). Keyword backend, §6. |
+| `read_journal_entry` | `path` accepts an entry id or `journal://entry/<id>`; a filesystem-looking path returns a clear error naming the id form. |
+| `list_recent_entries` | Same args. `ORDER BY created_at DESC` with a `days` cutoff. |
 | `read_recent_entries` | Same args. |
 
-Output text formatting is preserved verbatim (score, date, sections, path, excerpt lines), except
-that `Path:` becomes `Id:`. **[OPEN]** if strict text compatibility matters more than clarity, keep
-the `Path:` label with the id as its value.
+Result text keeps the current line structure (score, date, sections, path, excerpt) so output stays
+familiar; the `Path:` label keeps its name and carries the entry id as its value, which means a
+model that pipes a search result straight into `read_journal_entry` keeps working verbatim.
 
-Errors follow MCP tool-error conventions; auth failures are HTTP-level (§8), not tool errors.
+Errors follow MCP tool-error conventions. Auth failures are HTTP-level (§8), never tool errors.
 
-## 6. Search **[OPEN — Q1, the biggest decision]**
+## 6. Search — D1 FTS5 (keyword)
 
-The local implementation is semantic-only (MiniLM embeddings, in-memory cosine). On Workers there
-are three viable shapes:
+Semantic search is **not** ported. The Worker runs SQLite full-text search only: no Vectorize
+index, no Workers AI binding, no embedding step in the write path, no per-query inference cost, and
+a test suite that runs fully offline against local Miniflare.
 
-**A. Keyword only — D1 FTS5.**
-`entries_fts MATCH ?` with `bm25()` ranking and `snippet()` for excerpts. Zero extra bindings, zero
-extra cost, sub-10 ms, deterministic and testable. Loses conceptual matching: a query like
-*"times I felt frustrated with TypeScript"* only hits entries containing those literal words.
+Query handling — the important part, because callers pass natural language:
 
-**B. Semantic only — Workers AI + Vectorize.**
-Embed on write with `@cf/baai/bge-m3` (multilingual, matters if entries are ever German) or
-`@cf/baai/bge-base-en-v1.5` (768 dims, English). Store vectors in a Vectorize index with
-`{scope, project, created_at, sections}` metadata for filtering; D1 stays the content store.
-Vectorize has a free tier (5 M stored / 30 M queried dimensions per month); Workers AI inference is
-billed in neurons with a small daily free allowance. Closest to today's behaviour, adds two bindings
-and a write-path dependency (embedding failure must not lose the entry — write to D1 first, embed in
-`ctx.waitUntil`, reconcile missing vectors on a cron).
+1. Normalise the query: strip FTS5 operator characters, lowercase, split on whitespace.
+2. Drop stopwords and single-character tokens.
+3. Build a disjunction — `term1 OR term2 OR …` — so a sentence-shaped query does not degrade into
+   an AND that matches nothing. Quoted substrings in the input are preserved as phrase queries.
+4. Rank with `bm25(entries_fts)`, apply scope/section/date filters as SQL, and take the top `limit`.
+5. Excerpts come from `snippet(entries_fts, …)`, which highlights matched terms — replacing the
+   hand-rolled sliding-window excerpt logic in `src/search.ts`.
 
-**C. Hybrid (recommended).**
-Run A and B in parallel, fuse with reciprocal rank fusion. Semantic recall plus exact-term
-precision, and the server degrades to A automatically when the Vectorize/AI bindings are absent —
-which also keeps local `wrangler dev` and CI fast and offline.
+`bm25()` returns negative values where lower is better. The tool output maps them onto a `0…1`
+score (`1 / (1 + exp(bm25))`, monotonic) so the rendered `[Score: 0.812]` line stays meaningful and
+comparable within a result set.
 
-Recommendation: **C**, implemented as A first, with the vector path behind a binding check so it can
-land in a second pass.
+Accepted trade-off: conceptual queries such as *"times I felt frustrated with TypeScript"* only
+match entries containing those words. §13 keeps a vector backend as a clearly separable later step —
+the store and search layers are split so it can be added without touching the tool handlers.
 
-Section filters (`sections: ['reflections']`) apply as a SQL join in A and as metadata filters in B.
-`type: 'project' | 'user' | 'both'` maps to the `scope` column in both.
+## 7. Project / user scoping
 
-## 7. Project / user scoping **[OPEN — Q3]**
+`process_thoughts` gains an optional `project` argument (a slug, e.g. the repo name). Routing:
 
-The split has to come from somewhere now that there is no CWD. Options:
+| Input | Result |
+| --- | --- |
+| `project` argument present | `project_notes` → `scope='project'`, `project=<slug>` |
+| absent, token has a configured `project` | that slug is used |
+| absent, token has none | `project_notes` are stored with `scope='user'` |
+| all other sections | always `scope='user'`, `project=NULL` |
 
-1. **Explicit argument.** `process_thoughts` and the read tools take an optional `project` string.
-   Claude passes the repo name. Simple, transparent, but relies on the model to pass it consistently
-   — mitigated by documenting it in CLAUDE.md.
-2. **Per-token default.** Each token is configured with a project slug; `project_notes` written with
-   that token always land in that project. Zero model burden, but needs a token per project.
-3. **Flat.** Drop the project/user distinction; everything is one stream, `type` is ignored (or
-   becomes a stored label only).
-
-Recommendation: **1 with 2 as a fallback default** — an explicit `project` argument wins, otherwise
-the token's configured default, otherwise `scope='user'`. This keeps single-token setups trivial and
-still supports per-repo separation.
+`search_journal` / `list_recent_entries` / `read_recent_entries` keep their `type` argument
+(`project` | `user` | `both`) mapping onto the `scope` column, and additionally accept `project` to
+narrow to one project. This keeps single-token setups trivial while still supporting per-repo
+separation, and the README documents passing `project` so the model does it consistently.
 
 ## 8. Authentication
 
-**Token store.** Secret `JOURNAL_TOKENS` holds a JSON array, so multiple clients can be issued
-distinct tokens and revoked individually without touching the others:
+Two ways in, one identity model. Every request ultimately resolves to a **token label**, which is
+recorded on writes (`entries.client_label`) and lets a single client be revoked without disturbing
+the others.
+
+### 8.1 Static tokens
+
+Secret `JOURNAL_TOKENS` holds a JSON array:
 
 ```json
 [{ "label": "laptop", "token": "…", "project": "private-journal-mcp" },
  { "label": "web",    "token": "…" }]
 ```
 
-A single-token setup can instead set `JOURNAL_TOKEN=<token>`. Comparison is constant-time
-(`crypto.subtle.timingSafeEqual` over SHA-256 digests) to avoid leaking the token via timing.
+A single-token setup may instead set `JOURNAL_TOKEN=<token>` (label defaults to `default`).
+Comparison is constant-time: SHA-256 both sides, compare digests with `crypto.subtle.timingSafeEqual`.
 
-**MCP.** `Authorization: Bearer <token>` on every request. Missing/invalid → `401` with
-`WWW-Authenticate: Bearer`. Note that MCP's authorization spec is *optional* for servers but,
-when implemented over HTTP, it expects OAuth 2.1 with RFC 9728 resource metadata. A static bearer
-token deviates from that: it works with any client that can set a header (Claude Code
-`claude mcp add --transport http … --header "Authorization: Bearer …"`, `mcp-remote`, curl), but the
-one-click "add a connector" flows that rely on OAuth discovery will not complete. **[OPEN — Q4]**
+`POST /mcp` accepts `Authorization: Bearer <token>` with a static token directly. This is what
+Claude Code uses:
 
-**UI.** `GET /login` renders a single password field; the submitted value is checked against the
-same token list. On success the Worker sets `__Host-journal=<payload>.<hmac>` — HttpOnly, Secure,
-SameSite=Lax, signed with `SESSION_SECRET`, 30-day expiry, carrying the token label so a revoked
-token invalidates its sessions. `POST /logout` clears it. No session storage needed.
+```bash
+claude mcp add --transport http journal https://<worker>/mcp \
+  --header "Authorization: Bearer <token>"
+```
 
-**Hardening.** HSTS; `Content-Security-Policy: default-src 'self'; script-src 'none'` (the UI needs
-no JavaScript); CSRF token on the login and any mutating form; `X-Content-Type-Options: nosniff`;
-`Cache-Control: no-store` on every authenticated response; rate limit failed logins per IP via the
-Rate Limiting binding.
+Missing or invalid credentials → `401` with
+`WWW-Authenticate: Bearer resource_metadata="https://<host>/.well-known/oauth-protected-resource", scope="journal"`.
+
+### 8.2 OAuth 2.1 layer
+
+MCP's authorization spec is optional for servers, but clients that discover servers by URL (the
+one-click "add a connector" flows) expect an OAuth 2.1 resource server. The Worker therefore acts as
+**both** resource server and a minimal authorization server, where "logging in" means entering the
+same journal token.
+
+Endpoints:
+
+| Route | Purpose |
+| --- | --- |
+| `GET /.well-known/oauth-protected-resource` and `…/mcp` | RFC 9728 metadata: `resource` = canonical `https://<host>/mcp`, `authorization_servers` = `["https://<host>"]`, `scopes_supported` = `["journal"]` |
+| `GET /.well-known/oauth-authorization-server` | RFC 8414 metadata: `authorization_endpoint`, `token_endpoint`, `registration_endpoint`, `code_challenge_methods_supported: ["S256"]`, `grant_types_supported: ["authorization_code","refresh_token"]`, `authorization_response_iss_parameter_supported: true` |
+| `GET /oauth/authorize` | Renders the token prompt (same page as the UI login) |
+| `POST /oauth/authorize` | Validates the token, issues an authorization code bound to `client_id`, `redirect_uri`, `resource` and the PKCE `code_challenge`; redirects with `code` and `iss` (RFC 9207) |
+| `POST /oauth/token` | `authorization_code` (PKCE `S256` required) and `refresh_token` grants |
+| `POST /oauth/register` | Minimal RFC 7591 dynamic client registration, for clients that need it |
+
+Client identification supports both mechanisms the spec allows: an `https://` URL `client_id` is
+treated as a Client ID Metadata Document (fetched, cached, `redirect_uris` validated against it),
+and `POST /oauth/register` covers older clients that only speak DCR.
+
+Tokens:
+
+- **Access token** — HMAC-signed, self-contained (`sub` = token label, `aud` = canonical resource
+  URI, `scope` = `journal`, `exp` = 1 h), signed with `SESSION_SECRET`. Validation is a signature
+  and claims check with no database round-trip. The audience check is mandatory: a token whose
+  `aud` is not this server's canonical URI is rejected, and tokens are never forwarded anywhere.
+- **Refresh token** — opaque, stored hashed in D1, rotated on every use, 30-day idle expiry.
+
+```sql
+CREATE TABLE oauth_clients (
+  client_id TEXT PRIMARY KEY, redirect_uris TEXT NOT NULL,
+  client_name TEXT, created_at INTEGER NOT NULL
+);
+CREATE TABLE oauth_codes (
+  code_hash TEXT PRIMARY KEY, client_id TEXT NOT NULL, redirect_uri TEXT NOT NULL,
+  code_challenge TEXT NOT NULL, resource TEXT, token_label TEXT NOT NULL,
+  expires_at INTEGER NOT NULL          -- 60 s TTL, single use
+);
+CREATE TABLE oauth_refresh_tokens (
+  token_hash TEXT PRIMARY KEY, client_id TEXT NOT NULL, token_label TEXT NOT NULL,
+  expires_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0
+);
+```
+
+Expired codes and refresh tokens are deleted opportunistically on write, so no cron is needed.
+
+### 8.3 UI session
+
+`GET /login` renders a single password field; the value is checked against the same token list. On
+success the Worker sets `__Host-journal=<payload>.<hmac>` — HttpOnly, Secure, SameSite=Lax, signed
+with `SESSION_SECRET`, 30-day expiry, carrying the token label so revoking a token invalidates its
+sessions. `POST /logout` clears it. No server-side session storage.
+
+### 8.4 Hardening
+
+HSTS; `Content-Security-Policy: default-src 'self'; script-src 'none'` (the UI ships no
+JavaScript); CSRF token on the login, OAuth consent and delete forms; `X-Content-Type-Options:
+nosniff`; `Referrer-Policy: no-referrer`; `Cache-Control: no-store` on every authenticated
+response; per-IP rate limiting on failed logins and token exchanges via the Rate Limiting binding.
 
 ## 9. Web UI
 
-Server-rendered HTML, no build step, no client JavaScript, inline CSS with
-`prefers-color-scheme` support. Markdown is rendered server-side with raw HTML disabled and the
-source escaped first, since entry bodies are model-authored text.
+Server-rendered HTML, no build step, no client JavaScript, inline CSS with `prefers-color-scheme`
+support. Markdown is rendered server-side with raw HTML disabled and the source escaped first, since
+entry bodies are model-authored text.
 
 | Route | Content |
 | --- | --- |
 | `GET /` | Reverse-chronological entries grouped by `local_date`; scope/project filter; search box; cursor pagination on `(created_at, id)` |
-| `GET /entries/:id` | Full entry: title, timestamp, scope/project, rendered sections, prev/next links |
-| `GET /search?q=&type=&sections=` | Same ranking as `search_journal`, with highlighted excerpts |
-| `GET /login`, `POST /login`, `POST /logout` | Auth |
-| `GET /healthz` | Unauthenticated liveness probe, no data |
+| `GET /entries/:id` | Full entry: title, timestamp, scope/project, rendered sections, prev/next links, delete button |
+| `POST /entries/:id/delete` | CSRF-protected, confirmation page first; cascades to `entry_sections` and the FTS index |
+| `GET /search?q=&type=&sections=` | Same ranking as `search_journal`, with highlighted snippets |
+| `GET /login`, `POST /login`, `POST /logout` | Auth (§8.3) |
+| `GET /healthz` | Unauthenticated liveness probe, exposes no data |
 
-**[OPEN — Q5]** whether the UI is read-only or also allows deleting/editing entries.
+Entries are not editable through the UI — the journal stays a model-authored record.
 
 ## 10. Configuration
 
 | Name | Kind | Purpose |
 | --- | --- | --- |
-| `JOURNAL_TOKENS` / `JOURNAL_TOKEN` | secret | Auth (§8) |
-| `SESSION_SECRET` | secret | Cookie HMAC key |
+| `JOURNAL_TOKENS` / `JOURNAL_TOKEN` | secret | Auth (§8.1) |
+| `SESSION_SECRET` | secret | HMAC key for cookies and access tokens |
 | `JOURNAL_TZ` | var | IANA tz for `local_date` and display. Default `Europe/Berlin` |
 | `DB` | D1 binding | Storage |
-| `VECTORIZE` | Vectorize binding | Optional; enables semantic search |
-| `AI` | Workers AI binding | Optional; embedding generation |
 
-`wrangler.jsonc` with `compatibility_date` pinned to the current date and `nodejs_compat` enabled.
+`wrangler.jsonc` with a pinned `compatibility_date` and `nodejs_compat`. Deployment is manual:
 
-## 11. Migration of existing entries
+```bash
+cd worker
+npx wrangler d1 create private-journal      # once; id goes into wrangler.jsonc
+npx wrangler d1 migrations apply private-journal --remote
+npx wrangler secret put JOURNAL_TOKENS
+npx wrangler secret put SESSION_SECRET
+npm run deploy
+```
 
-`scripts/import-local-journal.ts` walks a local `.private-journal` directory, parses frontmatter and
-`## Section` headings, and POSTs batches to an authenticated `POST /admin/import` endpoint that is
-idempotent on a content hash, so re-running it is safe. Embeddings in `.embedding` sidecars are
-*not* imported — dimensions and model differ; vectors are regenerated server-side. **[OPEN — Q6]**
+No CI deploy workflow, no custom domain — the Worker is reachable at its `*.workers.dev` hostname.
+Both are additive later; a custom domain only needs a `routes` entry plus re-issuing the OAuth
+metadata under the new origin.
+
+## 11. Migration
+
+None. The Worker starts empty; existing local `.private-journal` directories stay where they are and
+remain readable through the unchanged stdio server. No import endpoint, no parser, no admin routes —
+which also means the Worker exposes no bulk-write surface at all.
 
 ## 12. Testing
 
-- `vitest` + `@cloudflare/vitest-pool-workers` runs the Worker against local Miniflare D1, applying
-  the same migrations as production.
-- Coverage: auth (valid/invalid/missing token, cookie forgery), the full MCP tool surface over real
-  HTTP requests to `/mcp`, scope routing of sections, FTS5 ranking, UI rendering and escaping.
-- A parity test asserting Worker markdown output matches the local `JournalManager` rendering.
-- Existing Jest suite for the root package is untouched.
+- `vitest` + `@cloudflare/vitest-pool-workers` against local Miniflare D1, applying the production
+  migrations.
+- Coverage:
+  - auth: valid/invalid/missing static token, forged and expired cookies, forged access tokens,
+    wrong-audience tokens, PKCE mismatch, code replay, refresh rotation;
+  - the full MCP tool surface driven as real HTTP requests against `/mcp`, including
+    `server/discover` and a legacy `initialize` handshake;
+  - section routing (which sections land in which scope), `project` resolution precedence (§7);
+  - FTS5: natural-language query building, stopword handling, ranking order, section/scope filters;
+  - UI: rendering, HTML escaping of entry content, delete flow with and without CSRF token.
+- A parity test asserting Worker markdown output matches `JournalManager`'s rendering byte for byte.
+- The root Jest suite is untouched and keeps running as before.
 
 ## 13. Delivery plan
 
-1. Scaffold `worker/`, wrangler config, D1 migration, store layer, tests. — no behaviour yet
-2. MCP endpoint with all five tools + bearer auth. Usable from Claude Code at this point.
-3. Web UI: login, list, detail, keyword search.
-4. Semantic search: Workers AI embeddings, Vectorize index, hybrid fusion, backfill cron.
-5. Import script, README/CLAUDE.md documentation, deploy notes.
+1. Scaffold `worker/`, wrangler config, D1 migration, store layer, tests.
+2. MCP endpoint with all five tools + static bearer auth. Usable from Claude Code at this point.
+3. FTS5 search: query builder, ranking, snippets, filters.
+4. Web UI: login, list, detail, search, delete.
+5. OAuth 2.1 layer: metadata documents, authorize/token/register, PKCE, refresh rotation.
+6. README and CLAUDE.md documentation, deploy runbook.
 
-Steps 1–3 are the minimum viable deployment; 4 and 5 are independently shippable.
+Steps 1–4 are the minimum viable deployment; step 5 is independently shippable and only affects
+clients that discover the server by URL.
 
-## 14. Open questions
+A later, optional step 7 would add semantic search back (Workers AI embeddings + Vectorize, hybrid
+rank fusion with the FTS5 results). The store/search split in §3 keeps that behind one module.
 
-| # | Question | Proposed default |
+## 14. Decisions
+
+| # | Question | Decision |
 | --- | --- | --- |
-| Q1 | Search backend: FTS5, Vectorize, or hybrid? (§6) | Hybrid, FTS5 first |
-| Q2 | Repo layout: self-contained `worker/` or npm workspaces with shared core? (§3) | Self-contained `worker/` |
-| Q3 | Project scoping: explicit argument, per-token, or flat? (§7) | Argument + per-token default |
-| Q4 | Static token only, or also an OAuth shim for one-click connectors? (§8) | Static token only |
-| Q5 | UI read-only, or with delete/edit? (§9) | Read-only + delete |
-| Q6 | Import existing local journal entries? (§11) | Yes, one-off script |
-| Q7 | Conventions from the existing `tools` repo (wrangler style, CI deploy, naming, custom domain) | Unknown — needs input |
-| Q8 | Does the local stdio server stay file-based, or gain a `--remote` mode pointing at the Worker? | Stays file-based |
+| Q1 | Search backend | **D1 FTS5 only.** No Vectorize, no Workers AI (§6) |
+| Q2 | Repo layout | **Self-contained `worker/`**, root package untouched (§3) |
+| Q3 | Project scoping | **`project` argument, falling back to the token's default** (§7) |
+| Q4 | Auth | **Token plus a minimal OAuth 2.1 shim** (§8.2) |
+| Q5 | UI scope | **Read + delete**, no editing (§9) |
+| Q6 | Import existing entries | **No.** Green field (§11) |
+| Q7 | Deployment | **Manual `wrangler deploy`**, `*.workers.dev`, no CI workflow (§10) |
+| Q8 | Conventions | **Current Cloudflare defaults** — wrangler.jsonc, Hono, vitest workers pool |
+| Q9 | Local stdio server | **Unchanged**, stays file-based; no `--remote` mode |
+
+Assumptions taken without asking, cheap to change: `JOURNAL_TZ` defaults to `Europe/Berlin`; entry
+ids are ULIDs; access tokens live 1 h and refresh tokens 30 days; the UI paginates 50 entries a page.
