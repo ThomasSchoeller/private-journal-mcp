@@ -2,6 +2,20 @@
 
 A comprehensive MCP (Model Context Protocol) server that provides Claude with private journaling and semantic search capabilities for processing thoughts, reflections, and insights.
 
+## About this fork
+
+This is a fork of [obra/private-journal-mcp](https://github.com/obra/private-journal-mcp). It exists
+for one addition: an optional **remote deployment on Cloudflare Workers** (`worker/`), which keeps
+the journal in a D1 database instead of a local directory, so one journal is shared across every
+machine and agent session that holds a token — something a filesystem-backed stdio server cannot do.
+See [Remote deployment](#remote-deployment-cloudflare-workers) below.
+
+Everything else is upstream and deliberately unchanged: the local stdio server, its tools, its
+storage layout and its tests. That is also why the `npx` commands in this README still point at
+`github:obra/private-journal-mcp` — for local use this fork has nothing to add, and following
+upstream keeps you on the maintained version. Only the Worker deployment is specific to this fork,
+and it is run from a checkout of this repository rather than through `npx`.
+
 ## Features
 
 ### Journaling
@@ -148,6 +162,41 @@ I'm excited about this new search feature...
 
 Vector embeddings provide semantic understanding...
 ```
+
+## Remote deployment (Cloudflare Workers)
+
+This is what this fork adds; it does not exist upstream.
+
+The server can also run as a **remote MCP server** on Cloudflare Workers, storing entries in D1 so
+one journal is shared across every machine and agent session that holds a token. The same Worker
+serves a small web UI for browsing, searching and deleting entries.
+
+```bash
+cd worker && npm install
+npx wrangler d1 create private-journal        # paste the id into wrangler.jsonc
+npx wrangler d1 migrations apply private-journal --remote
+npx wrangler secret put JOURNAL_TOKENS
+npx wrangler secret put SESSION_SECRET
+npm run deploy
+```
+
+```bash
+claude mcp add --transport http journal https://<worker>.workers.dev/mcp \
+  --header "Authorization: Bearer <token>"
+```
+
+The tools are identical to the local ones, with two differences that follow from there being no
+filesystem: `read_journal_entry` takes the entry id from a search or list result rather than a path,
+and search is keyword-based (SQLite FTS5) rather than semantic. `process_thoughts` gains an optional
+`project` argument, since a Worker has no working directory to infer the project scope from.
+
+Access is by bearer token: a static journal token for clients configured by hand, or an OAuth 2.1
+access token for clients that discover the server by URL. The web UI signs in with the same token.
+
+This is additive: the local stdio server is unchanged and keeps using the filesystem, and `worker/`
+is self-contained with its own `package.json`, so the root package pulls in nothing from it. See
+[`worker/README.md`](worker/README.md) for the full runbook and
+[`docs/cloudflare-worker-spec.md`](docs/cloudflare-worker-spec.md) for the design.
 
 ## Development
 
