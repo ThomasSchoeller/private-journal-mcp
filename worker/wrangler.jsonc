@@ -8,6 +8,9 @@
   "vars": {
     // IANA timezone used to derive `local_date` and to render titles.
     "JOURNAL_TZ": "Europe/Berlin"
+    // Optional: pin the canonical origin so the OAuth issuer and audience never
+    // follow an unexpected Host header.
+    // "PUBLIC_ORIGIN": "https://private-journal.example.workers.dev"
   },
   "d1_databases": [
     {

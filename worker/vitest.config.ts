@@ -20,8 +20,8 @@ const CLIENT_METADATA: Record<string, unknown> = {
 };
 
 const TEST_TOKENS = [
-  { label: 'laptop', token: 'laptop-secret', project: 'private-journal-mcp' },
-  { label: 'web', token: 'web-secret' },
+  { label: 'laptop', token: 'laptop-secret-tttttttttttt', project: 'private-journal-mcp' },
+  { label: 'web', token: 'web-secret-tttttttttttttttt' },
 ];
 
 const migrations = await readD1Migrations(new URL('./migrations', import.meta.url).pathname);
@@ -33,7 +33,7 @@ export default defineConfig({
       miniflare: {
         bindings: {
           TEST_MIGRATIONS: migrations,
-          SESSION_SECRET: 'test-session-secret',
+          SESSION_SECRET: 'test-session-secret-ssssssss',
           JOURNAL_TOKENS: JSON.stringify(TEST_TOKENS),
           JOURNAL_TZ: 'Europe/Berlin',
         },

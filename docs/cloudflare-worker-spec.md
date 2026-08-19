@@ -220,6 +220,8 @@ Secret `JOURNAL_TOKENS` holds a JSON array:
 
 A single-token setup may instead set `JOURNAL_TOKEN=<token>` (label defaults to `default`).
 Comparison is constant-time: SHA-256 both sides, compare digests with `crypto.subtle.timingSafeEqual`.
+Tokens shorter than 24 characters are ignored with a warning rather than honoured, and failed
+bearer attempts on `/mcp` are charged against the same per-IP budget as failed logins.
 
 `POST /mcp` accepts `Authorization: Bearer <token>` with a static token directly. This is what
 Claude Code uses:
@@ -236,8 +238,10 @@ Missing or invalid credentials → `401` with
 
 MCP's authorization spec is optional for servers, but clients that discover servers by URL (the
 one-click "add a connector" flows) expect an OAuth 2.1 resource server. The Worker therefore acts as
-**both** resource server and a minimal authorization server, where "logging in" means entering the
-same journal token.
+**both** resource server and a minimal authorization server. Consent is granted from an existing web
+session: `/oauth/authorize` sends an anonymous visitor to `/login` first, so the journal token is
+never typed into a page a client linked the user to. Since registration is open to anyone, the
+consent screen names the host the code would be delivered to.
 
 Endpoints:
 
@@ -245,22 +249,31 @@ Endpoints:
 | --- | --- |
 | `GET /.well-known/oauth-protected-resource` and `…/mcp` | RFC 9728 metadata: `resource` = canonical `https://<host>/mcp`, `authorization_servers` = `["https://<host>"]`, `scopes_supported` = `["journal"]` |
 | `GET /.well-known/oauth-authorization-server` | RFC 8414 metadata: `authorization_endpoint`, `token_endpoint`, `registration_endpoint`, `code_challenge_methods_supported: ["S256"]`, `grant_types_supported: ["authorization_code","refresh_token"]`, `authorization_response_iss_parameter_supported: true` |
-| `GET /oauth/authorize` | Renders the token prompt (same page as the UI login) |
-| `POST /oauth/authorize` | Validates the token, issues an authorization code bound to `client_id`, `redirect_uri`, `resource` and the PKCE `code_challenge`; redirects with `code` and `iss` (RFC 9207) |
+| `GET /oauth/authorize` | Renders the consent screen for a signed-in browser; redirects to `/login?next=…` otherwise |
+| `POST /oauth/authorize` | Requires the session cookie, issues an authorization code bound to `client_id`, `redirect_uri`, `resource` and the PKCE `code_challenge`; redirects with `code` and `iss` (RFC 9207) |
 | `POST /oauth/token` | `authorization_code` (PKCE `S256` required) and `refresh_token` grants |
 | `POST /oauth/register` | Minimal RFC 7591 dynamic client registration, for clients that need it |
 
 Client identification supports both mechanisms the spec allows: an `https://` URL `client_id` is
-treated as a Client ID Metadata Document (fetched, cached, `redirect_uris` validated against it),
-and `POST /oauth/register` covers older clients that only speak DCR.
+treated as a Client ID Metadata Document, and `POST /oauth/register` covers older clients that only
+speak DCR. Both go through the same redirect-target allowlist — `https:` anywhere, plain `http:`
+only on loopback, plus reverse-DNS custom schemes for native apps. The metadata fetch is a single
+un-followed hop with a 5 s deadline and a 64 KiB cap, cached at most 64 documents for 5 minutes; the
+client table is purged of unused rows after 30 days, metered per IP beyond 50 clients and capped at
+200.
 
 Tokens:
 
 - **Access token** — HMAC-signed, self-contained (`sub` = token label, `aud` = canonical resource
-  URI, `scope` = `journal`, `exp` = 1 h), signed with `SESSION_SECRET`. Validation is a signature
-  and claims check with no database round-trip. The audience check is mandatory: a token whose
-  `aud` is not this server's canonical URI is rejected, and tokens are never forwarded anywhere.
-- **Refresh token** — opaque, stored hashed in D1, rotated on every use, 30-day idle expiry.
+  URI, `scope` = `journal`, `exp` = 1 h), signed with a subkey derived from `SESSION_SECRET` — each
+  purpose (session cookie, CSRF, access token) gets its own, so a signature minted for one can never
+  verify as another. Validation is a signature and claims check with no database round-trip. The
+  audience check is mandatory: a token whose `aud` is not this server's canonical URI is rejected,
+  and tokens are never forwarded anywhere. `PUBLIC_ORIGIN` pins that canonical URI when the Worker
+  answers on more than one hostname.
+- **Refresh token** — opaque, stored hashed in D1, rotated on every use, 30-day idle expiry. A spent
+  token's row survives until it expires, so replaying it is recognised as a replay and revokes every
+  refresh token in the same chain.
 
 ```sql
 CREATE TABLE oauth_clients (

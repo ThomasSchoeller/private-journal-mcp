@@ -1,7 +1,7 @@
 // ABOUTME: The static journal token list and constant-time verification
 // ABOUTME: Every authenticated request resolves to one of these labels
 
-import type { Env } from '../env.js';
+import { MIN_SECRET_LENGTH, type Env } from '../env.js';
 import { secretEquals } from './crypto.js';
 
 export interface JournalToken {
@@ -15,13 +15,35 @@ export interface JournalToken {
 function isJournalToken(value: unknown): value is JournalToken {
   if (typeof value !== 'object' || value === null) return false;
   const candidate = value as Record<string, unknown>;
-  return (
-    typeof candidate.label === 'string' &&
-    candidate.label.length > 0 &&
-    typeof candidate.token === 'string' &&
-    candidate.token.length > 0 &&
-    (candidate.project === undefined || typeof candidate.project === 'string')
+  if (
+    typeof candidate.label !== 'string' ||
+    candidate.label.length === 0 ||
+    typeof candidate.token !== 'string' ||
+    (candidate.project !== undefined && typeof candidate.project !== 'string')
+  ) {
+    return false;
+  }
+  return isStrongEnough(candidate.token, `token '${candidate.label}'`);
+}
+
+const warned = new Set<string>();
+
+/**
+ * A journal token is the whole credential — it grants the MCP endpoint and the
+ * web UI at once — so a guessable one is dropped instead of being honoured. The
+ * warning is the only signal the operator gets, hence the explicit wording.
+ */
+function isStrongEnough(token: string, description: string): boolean {
+  if (token.length >= MIN_SECRET_LENGTH) return true;
+  // Tokens are parsed per request; the operator needs the warning once, not on
+  // every call.
+  if (warned.has(description)) return false;
+  warned.add(description);
+  console.warn(
+    `Ignoring journal ${description}: shorter than ${MIN_SECRET_LENGTH} characters. ` +
+      `Generate one with 'openssl rand -base64 32'.`
   );
+  return false;
 }
 
 /**
@@ -45,7 +67,7 @@ export function parseTokens(env: Env): JournalToken[] {
     }
   }
 
-  if (env.JOURNAL_TOKEN) {
+  if (env.JOURNAL_TOKEN && isStrongEnough(env.JOURNAL_TOKEN, "token 'default'")) {
     tokens.push({ label: 'default', token: env.JOURNAL_TOKEN });
   }
 

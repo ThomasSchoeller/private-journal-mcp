@@ -1,10 +1,11 @@
 import { SELF, env } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
-import { base64UrlEncode, encodeJson, hmacSign } from '../src/auth/crypto.js';
+import { parseTokens } from '../src/auth/tokens.js';
+import { base64UrlEncode, deriveSecret, encodeJson, hmacSign } from '../src/auth/crypto.js';
 import { issueAccessToken, origins } from '../src/auth/oauth.js';
 import { LAPTOP_TOKEN, ORIGIN, login, mcpRequest, readJsonRpc } from './helpers.js';
 
-const O = origins(`${ORIGIN}/mcp`);
+const O = origins(env, `${ORIGIN}/mcp`);
 
 /** Mints an access token with hand-chosen claims, signed with the real secret. */
 async function craftAccessToken(claims: Record<string, unknown>, secret?: string): Promise<string> {
@@ -21,7 +22,10 @@ async function craftAccessToken(claims: Record<string, unknown>, secret?: string
     jti: 'test',
     ...claims,
   });
-  const signature = await hmacSign(secret ?? env.SESSION_SECRET, `${header}.${payload}`);
+  const signature = await hmacSign(
+    secret ?? (await deriveSecret(env.SESSION_SECRET, 'oauth-access')),
+    `${header}.${payload}`
+  );
   return `${header}.${payload}.${signature}`;
 }
 
@@ -162,6 +166,73 @@ describe('UI session', () => {
     expect(response.status).toBe(303);
     expect(response.headers.get('set-cookie')).toContain('Max-Age=0');
   });
+});
+
+describe('credential strength', () => {
+  const base = { SESSION_SECRET: env.SESSION_SECRET } as unknown as typeof env;
+
+  it('ignores a journal token that is too short to resist guessing', () => {
+    const tokens = parseTokens({
+      ...base,
+      JOURNAL_TOKENS: JSON.stringify([
+        { label: 'weak', token: 'hunter2' },
+        { label: 'strong', token: 'strong-enough-token-tttttttt' },
+      ]),
+    });
+    expect(tokens.map((token) => token.label)).toEqual(['strong']);
+  });
+
+  it('ignores a short JOURNAL_TOKEN shorthand', () => {
+    expect(parseTokens({ ...base, JOURNAL_TOKEN: 'short' })).toEqual([]);
+  });
+});
+
+describe('brute force', () => {
+  it('starts refusing repeated bad tokens on /mcp', async () => {
+    // Its own client IP, so this test spends its own budget and not the one
+    // the other cases in this file rely on.
+    const attacker = { 'cf-connecting-ip': '203.0.113.9' };
+    const statuses: number[] = [];
+    for (let attempt = 0; attempt < 12; attempt++) {
+      const response = await SELF.fetch(`${ORIGIN}/mcp`, {
+        method: 'POST',
+        headers: { ...attacker, authorization: `Bearer guess-${attempt}`, 'content-type': 'application/json' },
+        body: '{}',
+      });
+      statuses.push(response.status);
+    }
+    expect(statuses[0]).toBe(401);
+    expect(statuses).toContain(429);
+  });
+});
+
+describe('login redirects', () => {
+  async function signInWithNext(next: string): Promise<string> {
+    const page = await SELF.fetch(`${ORIGIN}/login`);
+    const csrf = /name="csrf_token" value="([^"]+)"/.exec(await page.text())![1];
+    const response = await SELF.fetch(`${ORIGIN}/login?next=${encodeURIComponent(next)}`, {
+      method: 'POST',
+      headers: {
+        cookie: (page.headers.get('set-cookie') ?? '').split(';')[0],
+        'content-type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({ csrf_token: csrf, token: LAPTOP_TOKEN }),
+      redirect: 'manual',
+    });
+    expect(response.status).toBe(303);
+    return response.headers.get('location') ?? '';
+  }
+
+  it('follows a same-origin next parameter', async () => {
+    expect(await signInWithNext('/search?q=hello')).toBe('/search?q=hello');
+  });
+
+  it.each(['//evil.example.com/', '/\\evil.example.com/', 'https://evil.example.com/'])(
+    'refuses to bounce off-site via %s',
+    async (next) => {
+      expect(await signInWithNext(next)).toBe('/');
+    }
+  );
 });
 
 describe('hardening', () => {

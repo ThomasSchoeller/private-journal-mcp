@@ -1,7 +1,14 @@
 import { SELF } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import { pkceChallenge, randomToken } from '../src/auth/crypto.js';
-import { LAPTOP_TOKEN, ORIGIN, extractCsrf, mcpRequest } from './helpers.js';
+import {
+  ORIGIN,
+  cookieHeader,
+  extractCsrf,
+  login,
+  mcpRequest,
+  mergeCookies,
+} from './helpers.js';
 
 const REDIRECT_URI = 'https://client.example.com/callback';
 
@@ -24,12 +31,12 @@ async function registerClient(): Promise<string> {
   return ((await response.json()) as { client_id: string }).client_id;
 }
 
-/** Walks the consent screen the way a browser would. */
+/** Walks the consent screen the way a signed-in browser would. */
 async function authorize(options: {
   clientId: string;
   challenge: string;
   state?: string;
-  token?: string;
+  session?: string;
   resource?: string;
   redirectUri?: string;
 }): Promise<{ response: Response; authorized: Authorized | null }> {
@@ -43,14 +50,17 @@ async function authorize(options: {
   if (options.state) query.set('state', options.state);
   if (options.resource) query.set('resource', options.resource);
 
-  const page = await SELF.fetch(`${ORIGIN}/oauth/authorize?${query}`);
+  const session = options.session ?? (await login());
+  const page = await SELF.fetch(`${ORIGIN}/oauth/authorize?${query}`, {
+    headers: { cookie: session },
+    redirect: 'manual',
+  });
   if (!page.ok) return { response: page, authorized: null };
 
-  const cookie = (page.headers.get('set-cookie') ?? '').split(';')[0];
+  const cookie = mergeCookies(session, cookieHeader(page.headers.get('set-cookie') ?? ''));
   const html = await page.text();
   const form = new URLSearchParams(query);
   form.set('csrf_token', extractCsrf(html));
-  form.set('token', options.token ?? LAPTOP_TOKEN);
 
   const response = await SELF.fetch(`${ORIGIN}/oauth/authorize`, {
     method: 'POST',
@@ -123,6 +133,30 @@ describe('dynamic client registration', () => {
     });
   });
 
+  it.each([
+    'javascript://localhost/%0aalert(1)',
+    'http://evil.example.com/callback',
+    'data:text/html,x',
+    'not a url',
+  ])('rejects the redirect_uri %s', async (uri) => {
+    const response = await SELF.fetch(`${ORIGIN}/oauth/register`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ client_name: 'Test', redirect_uris: [uri] }),
+    });
+    expect(response.status).toBe(400);
+    expect(((await response.json()) as { error: string }).error).toBe('invalid_redirect_uri');
+  });
+
+  it('accepts a loopback redirect_uri for a native client', async () => {
+    const response = await SELF.fetch(`${ORIGIN}/oauth/register`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ client_name: 'Native', redirect_uris: ['http://127.0.0.1:7777/cb'] }),
+    });
+    expect(response.status).toBe(201);
+  });
+
   it('rejects a registration without redirect URIs', async () => {
     const response = await SELF.fetch(`${ORIGIN}/oauth/register`, {
       method: 'POST',
@@ -172,16 +206,59 @@ describe('authorization code flow', () => {
     expect(mcp.status).toBe(200);
   });
 
-  it('refuses to issue a code for the wrong journal token', async () => {
+  it('sends an anonymous browser to the login page instead of asking for the token', async () => {
     const clientId = await registerClient();
-    const { response, authorized } = await authorize({
-      clientId,
-      challenge: await pkceChallenge(randomToken(32)),
-      token: 'wrong-token',
+    const query = new URLSearchParams({
+      client_id: clientId,
+      redirect_uri: REDIRECT_URI,
+      response_type: 'code',
+      code_challenge: await pkceChallenge(randomToken(32)),
+      code_challenge_method: 'S256',
     });
-    expect(authorized).toBeNull();
+    const response = await SELF.fetch(`${ORIGIN}/oauth/authorize?${query}`, {
+      redirect: 'manual',
+    });
+    expect(response.status).toBe(303);
+    expect(response.headers.get('location')).toContain('/login?next=%2Foauth%2Fauthorize');
+  });
+
+  it('shows the redirect target and no token field once signed in', async () => {
+    const clientId = await registerClient();
+    const query = new URLSearchParams({
+      client_id: clientId,
+      redirect_uri: REDIRECT_URI,
+      response_type: 'code',
+      code_challenge: await pkceChallenge(randomToken(32)),
+      code_challenge_method: 'S256',
+    });
+    const response = await SELF.fetch(`${ORIGIN}/oauth/authorize?${query}`, {
+      headers: { cookie: await login() },
+    });
+    expect(response.status).toBe(200);
+    const html = await response.text();
+    expect(html).toContain('client.example.com');
+    expect(html).not.toContain('name="token"');
+  });
+
+  it('refuses a consent POST that carries no session', async () => {
+    const clientId = await registerClient();
+    const page = await SELF.fetch(`${ORIGIN}/login`);
+    const csrfCookie = cookieHeader(page.headers.get('set-cookie') ?? '');
+    const csrf = extractCsrf(await page.text());
+
+    const response = await SELF.fetch(`${ORIGIN}/oauth/authorize`, {
+      method: 'POST',
+      headers: { cookie: csrfCookie, 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: clientId,
+        redirect_uri: REDIRECT_URI,
+        code_challenge: await pkceChallenge(randomToken(32)),
+        csrf_token: csrf,
+      }),
+      redirect: 'manual',
+    });
     expect(response.status).toBe(401);
-    expect(await response.text()).toContain('not recognised');
+    expect(((await response.json()) as { error: string }).error).toBe('access_denied');
   });
 
   it('refuses a consent POST without a CSRF token', async () => {
@@ -193,7 +270,6 @@ describe('authorization code flow', () => {
         client_id: clientId,
         redirect_uri: REDIRECT_URI,
         code_challenge: await pkceChallenge(randomToken(32)),
-        token: LAPTOP_TOKEN,
       }),
     });
     expect(response.status).toBe(400);
@@ -336,6 +412,35 @@ describe('refresh tokens', () => {
     expect(replay.status).toBe(400);
 
     expect((await mcpRequest('tools/list', {}, { token: next.access_token })).status).toBe(200);
+  });
+
+  it('revokes the whole chain when a spent refresh token is replayed', async () => {
+    const clientId = await registerClient();
+    const tokens = await firstTokens(clientId);
+
+    const refreshed = await exchange({
+      grant_type: 'refresh_token',
+      refresh_token: tokens.refresh_token,
+      client_id: clientId,
+    });
+    const next = (await refreshed.json()) as { refresh_token: string };
+
+    const replay = await exchange({
+      grant_type: 'refresh_token',
+      refresh_token: tokens.refresh_token,
+      client_id: clientId,
+    });
+    expect(replay.status).toBe(400);
+    expect(await replay.text()).toContain('revoked');
+
+    // The token the legitimate client holds is part of the same compromised
+    // chain, so it stops working too.
+    const afterRevocation = await exchange({
+      grant_type: 'refresh_token',
+      refresh_token: next.refresh_token,
+      client_id: clientId,
+    });
+    expect(afterRevocation.status).toBe(400);
   });
 
   it('rejects a refresh token presented by another client', async () => {

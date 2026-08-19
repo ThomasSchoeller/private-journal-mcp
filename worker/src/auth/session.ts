@@ -2,7 +2,14 @@
 // ABOUTME: No server-side session storage — everything is carried in the cookie
 
 import type { Env } from '../env.js';
-import { hmacSign, hmacVerify, randomToken, signPayload, verifyPayload } from './crypto.js';
+import {
+  deriveSecret,
+  hmacSign,
+  hmacVerify,
+  randomToken,
+  signPayload,
+  verifyPayload,
+} from './crypto.js';
 
 export const SESSION_COOKIE = '__Host-journal';
 export const CSRF_COOKIE = '__Host-csrf';
@@ -16,6 +23,16 @@ interface SessionPayload {
   label: string;
   /** Expiry, seconds since epoch. */
   exp: number;
+}
+
+/** Subkey the UI session cookie is signed with. */
+function sessionKey(env: Env): Promise<string> {
+  return deriveSecret(env.SESSION_SECRET, 'session');
+}
+
+/** Subkey the CSRF double-submit value is signed with. */
+function csrfKey(env: Env): Promise<string> {
+  return deriveSecret(env.SESSION_SECRET, 'csrf');
 }
 
 export function parseCookies(header: string | null | undefined): Map<string, string> {
@@ -34,7 +51,7 @@ export async function createSessionCookie(env: Env, label: string): Promise<stri
     label,
     exp: Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS,
   };
-  const value = await signPayload(env.SESSION_SECRET, payload);
+  const value = await signPayload(await sessionKey(env), payload);
   return `${SESSION_COOKIE}=${value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${SESSION_TTL_SECONDS}`;
 }
 
@@ -49,7 +66,7 @@ export async function readSessionLabel(
 ): Promise<string | null> {
   const raw = parseCookies(cookieHeader).get(SESSION_COOKIE);
   if (!raw) return null;
-  const payload = await verifyPayload<SessionPayload>(env.SESSION_SECRET, raw);
+  const payload = await verifyPayload<SessionPayload>(await sessionKey(env), raw);
   if (!payload || typeof payload.label !== 'string' || typeof payload.exp !== 'number') {
     return null;
   }
@@ -64,7 +81,7 @@ export async function readSessionLabel(
  */
 export async function issueCsrf(env: Env): Promise<{ token: string; cookie: string }> {
   const nonce = randomToken(24);
-  const token = `${nonce}.${await hmacSign(env.SESSION_SECRET, `csrf:${nonce}`)}`;
+  const token = `${nonce}.${await hmacSign(await csrfKey(env), `csrf:${nonce}`)}`;
   return {
     token,
     cookie: `${CSRF_COOKIE}=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${CSRF_TTL_SECONDS}`,
@@ -83,5 +100,5 @@ export async function verifyCsrf(
   if (separator <= 0) return false;
   const nonce = submitted.slice(0, separator);
   const signature = submitted.slice(separator + 1);
-  return hmacVerify(env.SESSION_SECRET, `csrf:${nonce}`, signature);
+  return hmacVerify(await csrfKey(env), `csrf:${nonce}`, signature);
 }

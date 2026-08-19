@@ -144,6 +144,21 @@ describe('process_thoughts', () => {
   });
 });
 
+describe('input limits', () => {
+  it('refuses a limit outside the supported range', async () => {
+    for (const limit of [-1, 0, 1000]) {
+      const result = await callTool('read_recent_entries', { limit });
+      expect(result.isError).toBe(true);
+    }
+  });
+
+  it('refuses a section larger than one entry is allowed to be', async () => {
+    const result = await callTool('process_thoughts', { reflections: 'x'.repeat(100_001) });
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain('limit is 100000');
+  });
+});
+
 describe('read_journal_entry', () => {
   it('returns the full markdown, frontmatter and all', async () => {
     await callTool('process_thoughts', { reflections: 'Frontmatter comes back on read.' });

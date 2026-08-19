@@ -12,8 +12,9 @@ import { expect } from 'vitest';
 export const ORIGIN = 'https://journal.example.com';
 /** First revision of the modern, per-request-envelope era. */
 export const MODERN_PROTOCOL_VERSION = '2026-07-28';
-export const LAPTOP_TOKEN = 'laptop-secret';
-export const WEB_TOKEN = 'web-secret';
+// Long enough to clear MIN_SECRET_LENGTH, which the token parser enforces.
+export const LAPTOP_TOKEN = 'laptop-secret-tttttttttttt';
+export const WEB_TOKEN = 'web-secret-tttttttttttttttt';
 
 export interface JsonRpcResponse {
   jsonrpc: '2.0';

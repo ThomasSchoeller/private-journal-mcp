@@ -34,6 +34,12 @@ export interface McpContext {
   token: JournalToken;
 }
 
+/** Caps on what one tool call may pull out of the journal, or push into it. */
+const MAX_RESULTS = 100;
+const MAX_FULL_ENTRIES = 25;
+const MAX_DAYS = 3650;
+const MAX_SECTION_CHARS = 100_000;
+
 const scopeArg = z
   .enum(['project', 'user', 'both'])
   .default('both')
@@ -144,7 +150,14 @@ export function createJournalServer(context: McpContext): McpServer {
       const thoughts: Thoughts = {};
       for (const key of SECTION_KEYS) {
         const value = args[key];
-        if (typeof value === 'string' && value.length > 0) thoughts[key] = value;
+        if (typeof value !== 'string' || value.length === 0) continue;
+        if (value.length > MAX_SECTION_CHARS) {
+          throw new Error(
+            `${key} is ${value.length} characters; the limit is ${MAX_SECTION_CHARS}. ` +
+              'Split the thought across several entries.'
+          );
+        }
+        thoughts[key] = value;
       }
       if (Object.keys(thoughts).length === 0) {
         throw new Error('At least one thought category must be provided');
@@ -200,7 +213,13 @@ export function createJournalServer(context: McpContext): McpServer {
           .describe(
             "Natural language search query (e.g., 'times I felt frustrated with TypeScript', 'insights about Jesse's preferences', 'lessons about async patterns')"
           ),
-        limit: z.number().default(10).describe('Maximum number of results to return (default: 10)'),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(MAX_RESULTS)
+          .default(10)
+          .describe('Maximum number of results to return (default: 10)'),
         type: scopeArg,
         sections: z
           .array(z.string())
@@ -263,11 +282,23 @@ export function createJournalServer(context: McpContext): McpServer {
     {
       description: 'Get recent journal entries in chronological order.',
       inputSchema: z.object({
-        limit: z.number().default(10).describe('Maximum number of entries to return (default: 10)'),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(MAX_RESULTS)
+          .default(10)
+          .describe('Maximum number of entries to return (default: 10)'),
         type: scopeArg.describe(
           'List project-specific notes, user-global notes, or both (default: both)'
         ),
-        days: z.number().default(30).describe('Number of days back to search (default: 30)'),
+        days: z
+          .number()
+          .int()
+          .min(0)
+          .max(MAX_DAYS)
+          .default(30)
+          .describe('Number of days back to search (default: 30)'),
         project: z.string().optional().describe('Narrow results to one project slug'),
       }),
     },
@@ -296,7 +327,13 @@ export function createJournalServer(context: McpContext): McpServer {
     {
       description: 'Read the full content of your most recent journal entries.',
       inputSchema: z.object({
-        limit: z.number().default(5).describe('Number of recent entries to read (default: 5)'),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(MAX_FULL_ENTRIES)
+          .default(5)
+          .describe('Number of recent entries to read (default: 5)'),
         type: scopeArg.describe(
           'Read project-specific notes, user-global notes, or both (default: both)'
         ),

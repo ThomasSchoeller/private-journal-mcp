@@ -21,7 +21,13 @@ import {
   verifyCsrf,
 } from './auth/session.js';
 import { bearerCredential, tokenByLabel, verifyJournalToken, type JournalToken } from './auth/tokens.js';
-import { journalTimeZone, type AppEnv, type Env } from './env.js';
+import {
+  MIN_SECRET_LENGTH,
+  hasUsableSessionSecret,
+  journalTimeZone,
+  type AppEnv,
+  type Env,
+} from './env.js';
 import { createJournalServer, type McpContext } from './mcp.js';
 import { buildMatchQuery } from './search.js';
 import {
@@ -68,6 +74,24 @@ app.use('*', async (c, next) => {
   }
 });
 
+/**
+ * Every credential this server checks is signed with `SESSION_SECRET`. Serving
+ * requests without a usable one would mean handing out signatures nobody can
+ * trust, so the deployment says so plainly instead.
+ */
+app.use('*', async (c, next) => {
+  if (!hasUsableSessionSecret(c.env)) {
+    console.error(
+      `SESSION_SECRET is missing or shorter than ${MIN_SECRET_LENGTH} characters; refusing requests.`
+    );
+    return c.json(
+      { error: 'server_error', error_description: 'This deployment is not configured' },
+      503
+    );
+  }
+  await next();
+});
+
 app.get('/healthz', (c) => c.text('ok'));
 
 // ---------------------------------------------------------------- MCP endpoint
@@ -94,16 +118,24 @@ async function authenticateBearer(
   const direct = await verifyJournalToken(env, credential);
   if (direct) return { token: direct, credential };
 
-  const label = await verifyAccessToken(env, credential, origins(request.url));
+  const label = await verifyAccessToken(env, credential, origins(env, request.url));
   if (!label) return null;
   const token = tokenByLabel(env, label);
   return token ? { token, credential } : null;
 }
 
 app.all('/mcp', async (c) => {
-  const o = origins(c.req.url);
+  const o = origins(c.env, c.req.url);
   const authenticated = await authenticateBearer(c.env, c.req.raw);
   if (!authenticated) {
+    // Guessing a token here is the one path into the journal that no human sees,
+    // so failures are metered exactly like the ones at the login form.
+    if (!(await chargeFailure(c.env, c.req.raw, 'mcp'))) {
+      return c.json(
+        { error: 'too_many_requests', error_description: 'Too many attempts. Try again shortly.' },
+        429
+      );
+    }
     return c.json({ error: 'invalid_token', error_description: 'A journal token is required' }, 401, {
       'www-authenticate': bearerChallenge(o),
     });
@@ -122,18 +154,36 @@ app.all('/mcp', async (c) => {
 // ------------------------------------------------------------- OAuth discovery
 
 app.get('/.well-known/oauth-protected-resource', (c) =>
-  c.json(protectedResourceMetadata(origins(c.req.url)))
+  c.json(protectedResourceMetadata(origins(c.env, c.req.url)))
 );
 app.get('/.well-known/oauth-protected-resource/mcp', (c) =>
-  c.json(protectedResourceMetadata(origins(c.req.url)))
+  c.json(protectedResourceMetadata(origins(c.env, c.req.url)))
 );
 app.get('/.well-known/oauth-authorization-server', (c) =>
-  c.json(authorizationServerMetadata(origins(c.req.url)))
+  c.json(authorizationServerMetadata(origins(c.env, c.req.url)))
 );
 
 app.route('/oauth', oauthApp);
 
 // --------------------------------------------------------------------- UI auth
+
+/**
+ * Resolves a `next` parameter against this origin and keeps only what stays on
+ * it. String prefix checks are not enough here: browsers read `/\evil.com` as
+ * `//evil.com`, and the URL parser is the only thing that agrees with them.
+ */
+function sameOriginPath(requestUrl: string, next: string | null | undefined): string {
+  if (!next) return '/';
+  const base = new URL(requestUrl);
+  let resolved: URL;
+  try {
+    resolved = new URL(next, base);
+  } catch {
+    return '/';
+  }
+  if (resolved.origin !== base.origin) return '/';
+  return `${resolved.pathname}${resolved.search}`;
+}
 
 app.get('/login', async (c) => {
   const csrf = await issueCsrf(c.env);
@@ -164,7 +214,7 @@ app.post('/login', async (c) => {
       : fail(429, 'Too many attempts. Try again shortly.');
   }
 
-  const destination = next && next.startsWith('/') && !next.startsWith('//') ? next : '/';
+  const destination = sameOriginPath(c.req.url, next);
   c.header('set-cookie', await createSessionCookie(c.env, token.label));
   return c.redirect(destination, 303);
 });

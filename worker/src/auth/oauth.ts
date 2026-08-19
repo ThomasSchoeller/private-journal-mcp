@@ -1,12 +1,14 @@
 // ABOUTME: Minimal OAuth 2.1 authorization + resource server, so URL-discovery clients can connect
-// ABOUTME: "Logging in" means entering the same journal token the bearer flow uses
+// ABOUTME: Consent is granted from an already signed-in browser session, never by typing the token
 
 import { Hono } from 'hono';
 import type { AppEnv, Env } from '../env.js';
+import { queryString } from '../ui/layout.js';
 import { consentPage } from '../ui/pages.js';
 import {
   base64UrlEncode,
   decodeJson,
+  deriveSecret,
   encodeJson,
   hmacSign,
   hmacVerify,
@@ -14,13 +16,23 @@ import {
   sha256,
   sha256Hex,
 } from './crypto.js';
-import { issueCsrf, verifyCsrf } from './session.js';
-import { verifyJournalToken } from './tokens.js';
+import { issueCsrf, readSessionLabel, verifyCsrf } from './session.js';
+import { tokenByLabel } from './tokens.js';
 
 const ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 const REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const CODE_TTL_SECONDS = 60;
+const CLIENT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+/** Registrations are free to make, so the table is kept to a bounded size. */
+const CLIENT_METER_THRESHOLD = 50;
+const CLIENT_MAX_ROWS = 200;
 export const JOURNAL_SCOPE = 'journal';
+
+/** Client ID Metadata Documents are fetched from a URL a stranger chose. */
+const CIMD_TIMEOUT_MS = 5_000;
+const CIMD_MAX_BYTES = 64 * 1024;
+const CIMD_CACHE_TTL_MS = 5 * 60 * 1000;
+const CIMD_CACHE_MAX_ENTRIES = 64;
 
 export interface Origins {
   /** `https://host` — this server as an OAuth issuer. */
@@ -29,9 +41,52 @@ export interface Origins {
   resource: string;
 }
 
-export function origins(requestUrl: string): Origins {
-  const url = new URL(requestUrl);
-  return { issuer: url.origin, resource: `${url.origin}/mcp` };
+/**
+ * This server's own identity. `PUBLIC_ORIGIN` wins when set, so the issuer and
+ * the audience tokens are bound to stay put even if a request arrives carrying
+ * some other `Host`.
+ */
+export function origins(env: Env, requestUrl: string): Origins {
+  const configured = env.PUBLIC_ORIGIN?.trim();
+  let issuer: string;
+  if (configured) {
+    try {
+      issuer = new URL(configured).origin;
+    } catch {
+      issuer = new URL(requestUrl).origin;
+    }
+  } else {
+    issuer = new URL(requestUrl).origin;
+  }
+  return { issuer, resource: `${issuer}/mcp` };
+}
+
+/** Subkey OAuth access tokens are signed with. */
+function accessTokenKey(env: Env): Promise<string> {
+  return deriveSecret(env.SESSION_SECRET, 'oauth-access');
+}
+
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', '[::1]', '::1', 'localhost']);
+
+/**
+ * Redirect targets this server is willing to send an authorization code to:
+ * `https://` anywhere, plain `http://` only on the loopback interface (RFC 8252
+ * native apps), and reverse-DNS custom schemes such as `com.example.app:/cb`.
+ * Everything else — `javascript:`, `data:`, `file:`, plain `http://` on a real
+ * host — is refused.
+ */
+export function isAllowedRedirectUri(uri: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(uri);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol === 'https:') return parsed.hostname.length > 0;
+  if (parsed.protocol === 'http:') return LOOPBACK_HOSTS.has(parsed.hostname);
+  // A custom scheme has to look like a reversed domain name, which no
+  // browser-executable scheme does.
+  return /^[a-z][a-z0-9+-]*(\.[a-z0-9+-]+)+:$/.test(parsed.protocol);
 }
 
 export function protectedResourceMetadata(o: Origins) {
@@ -91,7 +146,7 @@ export async function issueAccessToken(
     new TextEncoder().encode(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))
   );
   const payload = encodeJson(claims);
-  const signature = await hmacSign(env.SESSION_SECRET, `${header}.${payload}`);
+  const signature = await hmacSign(await accessTokenKey(env), `${header}.${payload}`);
   return { token: `${header}.${payload}.${signature}`, expiresIn: ACCESS_TOKEN_TTL_SECONDS };
 }
 
@@ -107,7 +162,9 @@ export async function verifyAccessToken(
   const parts = token.split('.');
   if (parts.length !== 3) return null;
   const [header, payload, signature] = parts;
-  if (!(await hmacVerify(env.SESSION_SECRET, `${header}.${payload}`, signature))) return null;
+  if (!(await hmacVerify(await accessTokenKey(env), `${header}.${payload}`, signature))) {
+    return null;
+  }
 
   const claims = decodeJson<AccessTokenClaims>(payload);
   if (!claims || typeof claims.sub !== 'string') return null;
@@ -127,6 +184,95 @@ interface ClientRecord {
 const cimdCache = new Map<string, { record: ClientRecord; expires: number }>();
 
 /**
+ * Reads at most `limit` bytes of a response body. A metadata document is a few
+ * hundred bytes; anything larger is a host trying to tie up the isolate.
+ */
+async function readCapped(response: Response, limit: number): Promise<string | null> {
+  const body = response.body;
+  if (!body) return null;
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > limit) return null;
+      chunks.push(value);
+    }
+  } catch {
+    return null;
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+
+  const joined = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(joined);
+}
+
+/**
+ * Fetches a Client ID Metadata Document. The URL comes from an unauthenticated
+ * request, so this is a deliberately narrow outbound call: one hop, a short
+ * deadline and a hard size cap.
+ */
+async function fetchClientMetadata(clientId: string): Promise<ClientRecord | null> {
+  let response: Response;
+  try {
+    response = await fetch(clientId, {
+      headers: { accept: 'application/json' },
+      // 'manual' rather than 'error': a redirect then surfaces as a non-ok
+      // response instead of an exception, and either way it is not followed.
+      redirect: 'manual',
+      signal: AbortSignal.timeout(CIMD_TIMEOUT_MS),
+    });
+  } catch {
+    return null;
+  }
+  if (!response.ok) return null;
+
+  const body = await readCapped(response, CIMD_MAX_BYTES);
+  if (body === null) return null;
+
+  let document: Record<string, unknown> | null;
+  try {
+    document = JSON.parse(body) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  if (!document || typeof document !== 'object') return null;
+
+  const redirectUris = Array.isArray(document.redirect_uris)
+    ? document.redirect_uris.filter(
+        (uri): uri is string => typeof uri === 'string' && isAllowedRedirectUri(uri)
+      )
+    : [];
+  if (document.client_id !== clientId || redirectUris.length === 0) return null;
+
+  return {
+    clientId,
+    redirectUris,
+    clientName: typeof document.client_name === 'string' ? document.client_name : clientId,
+  };
+}
+
+/** Keeps the metadata cache from growing with every URL a stranger names. */
+function cacheClientMetadata(clientId: string, record: ClientRecord): void {
+  cimdCache.delete(clientId);
+  while (cimdCache.size >= CIMD_CACHE_MAX_ENTRIES) {
+    const oldest = cimdCache.keys().next();
+    if (oldest.done) break;
+    cimdCache.delete(oldest.value);
+  }
+  cimdCache.set(clientId, { record, expires: Date.now() + CIMD_CACHE_TTL_MS });
+}
+
+/**
  * Resolves a `client_id` through either mechanism the MCP authorization spec
  * allows: an `https://` id is a Client ID Metadata Document, anything else must
  * have been registered through {@link registerClient}.
@@ -136,27 +282,9 @@ export async function resolveClient(env: Env, clientId: string): Promise<ClientR
     const cached = cimdCache.get(clientId);
     if (cached && cached.expires > Date.now()) return cached.record;
 
-    let response: Response;
-    try {
-      response = await fetch(clientId, { headers: { accept: 'application/json' } });
-    } catch {
-      return null;
-    }
-    if (!response.ok) return null;
-
-    const document = (await response.json().catch(() => null)) as Record<string, unknown> | null;
-    if (!document) return null;
-    const redirectUris = Array.isArray(document.redirect_uris)
-      ? document.redirect_uris.filter((uri): uri is string => typeof uri === 'string')
-      : [];
-    if (document.client_id !== clientId || redirectUris.length === 0) return null;
-
-    const record: ClientRecord = {
-      clientId,
-      redirectUris,
-      clientName: typeof document.client_name === 'string' ? document.client_name : clientId,
-    };
-    cimdCache.set(clientId, { record, expires: Date.now() + 5 * 60 * 1000 });
+    const record = await fetchClientMetadata(clientId);
+    if (!record) return null;
+    cacheClientMetadata(clientId, record);
     return record;
   }
 
@@ -185,12 +313,53 @@ function decodeUris(value: string): string[] {
   }
 }
 
+/**
+ * Expired grant state, plus registered clients nothing has used. Revoked
+ * refresh tokens are kept until they expire on their own: their row is what
+ * lets a replay be recognised as a replay rather than as an unknown token.
+ */
 async function purgeExpired(env: Env): Promise<void> {
   const now = Date.now();
   await env.DB.batch([
     env.DB.prepare(`DELETE FROM oauth_codes WHERE expires_at < ?`).bind(now),
-    env.DB.prepare(`DELETE FROM oauth_refresh_tokens WHERE expires_at < ? OR revoked = 1`).bind(now),
+    env.DB.prepare(`DELETE FROM oauth_refresh_tokens WHERE expires_at < ?`).bind(now),
+    env.DB
+      .prepare(
+        `DELETE FROM oauth_clients
+          WHERE created_at < ?
+            AND client_id NOT IN (SELECT client_id FROM oauth_refresh_tokens)`
+      )
+      .bind(now - CLIENT_TTL_MS),
   ]);
+}
+
+async function countClients(env: Env): Promise<number> {
+  const row = await env.DB.prepare(`SELECT COUNT(*) AS count FROM oauth_clients`).first<{
+    count: number;
+  }>();
+  return row?.count ?? 0;
+}
+
+/**
+ * Keeps `oauth_clients` bounded no matter how many registrations arrive. The
+ * oldest clients go first, and only ones nothing holds a refresh token for —
+ * a working integration is never evicted out from under its user.
+ */
+async function evictSurplusClients(env: Env): Promise<void> {
+  const registered = await countClients(env);
+  const surplus = registered - CLIENT_MAX_ROWS;
+  if (surplus <= 0) return;
+  await env.DB.prepare(
+    `DELETE FROM oauth_clients
+      WHERE client_id IN (
+        SELECT client_id FROM oauth_clients
+         WHERE client_id NOT IN (SELECT client_id FROM oauth_refresh_tokens)
+         ORDER BY created_at ASC
+         LIMIT ?
+      )`
+  )
+    .bind(surplus)
+    .run();
 }
 
 function oauthError(status: number, code: string, description: string): Response {
@@ -200,12 +369,25 @@ function oauthError(status: number, code: string, description: string): Response
   });
 }
 
+let warnedAboutLimiter = false;
+
 /**
- * Charges one failed attempt against the per-IP budget. Only failures count, so
- * a working client is never throttled while a guessing one runs out quickly.
+ * Charges one attempt against the per-IP budget. Callers only charge failures
+ * (and registrations once the client table looks abused), so a working client
+ * is never throttled while a guessing one runs out quickly. Without the binding
+ * nothing is metered — the deployment stays up, and says so once.
  */
 export async function chargeFailure(env: Env, request: Request, kind: string): Promise<boolean> {
-  if (!env.LOGIN_LIMITER) return true;
+  if (!env.LOGIN_LIMITER) {
+    if (!warnedAboutLimiter) {
+      warnedAboutLimiter = true;
+      console.warn(
+        'No LOGIN_LIMITER binding: failed credential attempts are not being throttled. ' +
+          'Add the ratelimits entry from wrangler.jsonc.'
+      );
+    }
+    return true;
+  }
   const key = `${kind}:${request.headers.get('cf-connecting-ip') ?? 'unknown'}`;
   const { success } = await env.LOGIN_LIMITER.limit({ key });
   return success;
@@ -247,6 +429,13 @@ oauthApp.get('/authorize', async (c) => {
     return oauthError(400, 'invalid_request', 'code_challenge is required');
   }
 
+  // Consent is only ever granted by a browser that already signed in. Nobody
+  // is asked to type the journal token into a page a stranger linked them to.
+  const label = await readSessionLabel(c.env, c.req.header('cookie'));
+  if (!label || !tokenByLabel(c.env, label)) {
+    return c.redirect(`/login${queryString({ next: url.pathname + url.search })}`, 303);
+  }
+
   const params: Record<string, string> = {};
   for (const name of CARRIED_PARAMS) {
     const value = url.searchParams.get(name);
@@ -254,9 +443,16 @@ oauthApp.get('/authorize', async (c) => {
   }
 
   const csrf = await issueCsrf(c.env);
-  return c.html(consentPage({ csrf: csrf.token, clientName: client.clientName, params }), 200, {
-    'set-cookie': csrf.cookie,
-  });
+  return c.html(
+    consentPage({
+      csrf: csrf.token,
+      clientName: client.clientName,
+      redirectUri,
+      params,
+    }),
+    200,
+    { 'set-cookie': csrf.cookie }
+  );
 });
 
 oauthApp.post('/authorize', async (c) => {
@@ -282,31 +478,14 @@ oauthApp.post('/authorize', async (c) => {
     return oauthError(400, 'invalid_client', 'Unknown client or redirect_uri');
   }
 
-  const token = await verifyJournalToken(c.env, value('token'));
+  const label = await readSessionLabel(c.env, c.req.header('cookie'));
+  const token = label ? tokenByLabel(c.env, label) : null;
   if (!token) {
-    if (!(await chargeFailure(c.env, c.req.raw, 'authorize'))) {
-      return oauthError(429, 'too_many_requests', 'Too many attempts. Try again shortly.');
-    }
-    const csrf = await issueCsrf(c.env);
-    const params: Record<string, string> = {};
-    for (const name of CARRIED_PARAMS) {
-      const carried = value(name);
-      if (carried !== null) params[name] = carried;
-    }
-    return c.html(
-      consentPage({
-        csrf: csrf.token,
-        clientName: client.clientName,
-        params,
-        error: 'That token was not recognised.',
-      }),
-      401,
-      { 'set-cookie': csrf.cookie }
-    );
+    return oauthError(401, 'access_denied', 'Sign in before granting access');
   }
 
   const code = randomToken(32);
-  const o = origins(c.req.url);
+  const o = origins(c.env, c.req.url);
   await purgeExpired(c.env);
   await c.env.DB.prepare(
     `INSERT INTO oauth_codes
@@ -338,7 +517,7 @@ oauthApp.post('/token', async (c) => {
     const entry = form.get(name);
     return typeof entry === 'string' ? entry : null;
   };
-  const o = origins(c.req.url);
+  const o = origins(c.env, c.req.url);
   const grantType = value('grant_type');
 
   if (grantType === 'authorization_code') {
@@ -405,17 +584,34 @@ oauthApp.post('/token', async (c) => {
         expires_at: number;
         revoked: number;
       }>();
-    // Rotation: the presented token is spent even if this exchange fails.
-    await c.env.DB.prepare(`DELETE FROM oauth_refresh_tokens WHERE token_hash = ?`)
-      .bind(hash)
-      .run();
 
-    if (!row || row.revoked === 1 || row.expires_at < Date.now() || row.client_id !== clientId) {
+    const spend = async (description: string) => {
       if (!(await chargeFailure(c.env, c.req.raw, 'token'))) {
         return oauthError(429, 'too_many_requests', 'Too many attempts. Try again shortly.');
       }
-      return oauthError(400, 'invalid_grant', 'Refresh token is invalid or expired');
+      return oauthError(400, 'invalid_grant', description);
+    };
+
+    if (!row || row.expires_at < Date.now() || row.client_id !== clientId) {
+      return spend('Refresh token is invalid or expired');
     }
+    if (row.revoked === 1) {
+      // Someone replayed a token that was already rotated away. Either the
+      // client or a thief holds a copy, and there is no telling which, so the
+      // whole chain issued to this client goes.
+      await c.env.DB.prepare(
+        `UPDATE oauth_refresh_tokens SET revoked = 1 WHERE client_id = ? AND token_label = ?`
+      )
+        .bind(row.client_id, row.token_label)
+        .run();
+      return spend('Refresh token was already used; this authorization has been revoked');
+    }
+
+    // Rotation: the presented token is spent, but its row stays until it
+    // expires so a later replay is still recognisable.
+    await c.env.DB.prepare(`UPDATE oauth_refresh_tokens SET revoked = 1 WHERE token_hash = ?`)
+      .bind(hash)
+      .run();
     return tokenResponse(c.env, o, clientId, row.token_label);
   }
 
@@ -456,6 +652,15 @@ async function tokenResponse(
 }
 
 oauthApp.post('/register', async (c) => {
+  // Registration is unauthenticated by protocol design. Ordinary use adds a
+  // handful of clients and is never throttled; once the table looks like
+  // someone is filling it, further registrations are metered per IP.
+  await purgeExpired(c.env);
+  const registered = await countClients(c.env);
+  if (registered >= CLIENT_METER_THRESHOLD && !(await chargeFailure(c.env, c.req.raw, 'register'))) {
+    return oauthError(429, 'too_many_requests', 'Too many registrations. Try again shortly.');
+  }
+
   const metadata = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
   if (!metadata) return oauthError(400, 'invalid_client_metadata', 'Body must be JSON');
 
@@ -466,14 +671,8 @@ oauthApp.post('/register', async (c) => {
     return oauthError(400, 'invalid_redirect_uri', 'At least one redirect_uri is required');
   }
   for (const uri of redirectUris) {
-    try {
-      const parsed = new URL(uri);
-      const loopback = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1';
-      if (parsed.protocol !== 'https:' && !loopback && !parsed.protocol.includes('.')) {
-        return oauthError(400, 'invalid_redirect_uri', `Unsupported redirect_uri: ${uri}`);
-      }
-    } catch {
-      return oauthError(400, 'invalid_redirect_uri', `Malformed redirect_uri: ${uri}`);
+    if (!isAllowedRedirectUri(uri)) {
+      return oauthError(400, 'invalid_redirect_uri', `Unsupported redirect_uri: ${uri}`);
     }
   }
 
@@ -485,6 +684,7 @@ oauthApp.post('/register', async (c) => {
   )
     .bind(clientId, JSON.stringify(redirectUris), clientName, Date.now())
     .run();
+  await evictSurplusClients(c.env);
 
   return new Response(
     JSON.stringify({

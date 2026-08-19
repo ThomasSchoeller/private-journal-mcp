@@ -201,33 +201,42 @@ export function loginPage(options: { csrf: string; error?: string; next?: string
 }
 
 /**
- * The OAuth consent screen. It is the login form with the authorization request
- * carried through as hidden fields, so "logging in" and "granting access" are
- * the same act: entering the journal token.
+ * The OAuth consent screen. It is only ever reached with a valid session, so it
+ * asks for a decision rather than for the journal token — a page linked from
+ * elsewhere can never be used to collect the credential itself. The redirect
+ * target is spelled out because that, not the self-declared name, is what says
+ * where the authorization actually goes.
  */
 export function consentPage(options: {
   csrf: string;
   clientName: string;
+  redirectUri: string;
   params: Record<string, string>;
-  error?: string;
 }): string {
   const hidden = Object.entries(options.params)
     .map(([key, value]) => `<input type="hidden" name="${escapeHtml(key)}" value="${escapeHtml(value)}">`)
     .join('');
+
+  let target = options.redirectUri;
+  try {
+    const parsed = new URL(options.redirectUri);
+    target = parsed.host || parsed.protocol.replace(/:$/, '');
+  } catch {
+    // Never rendered unvalidated — fall back to the raw string, escaped below.
+  }
 
   return page(
     { title: 'Authorize access', bare: true },
     `<div class="login">
        <h2>Authorize access</h2>
        <p><strong>${escapeHtml(options.clientName)}</strong> is asking to read and write your journal.</p>
-       ${options.error ? `<p class="notice">${escapeHtml(options.error)}</p>` : ''}
+       <p class="notice">Codes will be sent to <strong>${escapeHtml(target)}</strong>. Only continue if you started this yourself.</p>
        <form method="post" action="/oauth/authorize">
          ${csrfField(options.csrf)}
          ${hidden}
-         <label for="token">Journal token</label>
-         <input id="token" name="token" type="password" autocomplete="current-password" required>
          <button type="submit">Allow</button>
        </form>
+       <p><a href="/">Cancel</a></p>
      </div>`
   );
 }

@@ -105,3 +105,12 @@ export function randomToken(bytes = 32): string {
 export async function pkceChallenge(verifier: string): Promise<string> {
   return base64UrlEncode(await sha256(verifier));
 }
+
+/**
+ * Purpose-bound subkey derived from the one configured secret. Session cookies,
+ * CSRF tokens and OAuth access tokens each sign under their own key, so a
+ * signature minted for one of them can never be replayed as another.
+ */
+export async function deriveSecret(secret: string, purpose: string): Promise<string> {
+  return hmacSign(secret, `private-journal/v1/${purpose}`);
+}

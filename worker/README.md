@@ -49,17 +49,21 @@ npx wrangler d1 migrations apply private-journal --remote
 #       {"label":"web","token":"…"}]
 #    or set JOURNAL_TOKEN instead for a single-token setup.
 npx wrangler secret put JOURNAL_TOKENS
-npx wrangler secret put SESSION_SECRET      # any long random string
+npx wrangler secret put SESSION_SECRET      # long random string, see below
 
 # 4. Ship it.
 npm run deploy
 ```
 
-Generate secrets with something like `openssl rand -base64 32`.
+Generate secrets with `openssl rand -base64 32`. Both are checked at request time: a journal token
+shorter than 24 characters is **ignored** (with a warning in `wrangler tail`, since a weak token is
+the whole credential), and a `SESSION_SECRET` shorter than that makes the Worker answer `503` rather
+than sign anything with it.
 
 Deployment is manual and the Worker lives at its `*.workers.dev` hostname. A custom domain only
 needs a `routes` entry in `wrangler.jsonc`; the OAuth metadata is derived from the request origin,
-so it follows the new hostname on its own.
+so it follows the new hostname on its own. Serving the same Worker under several hostnames is the
+case for setting `PUBLIC_ORIGIN`, which pins the issuer and the token audience to one of them.
 
 ## Connecting a client
 
@@ -72,9 +76,12 @@ claude mcp add --transport http journal https://<worker>.workers.dev/mcp \
 
 Clients that discover a server by URL use the OAuth layer instead: they read
 `/.well-known/oauth-protected-resource`, register (or present an `https://` client-id metadata
-document), and send the user to `/oauth/authorize`, where "logging in" means entering the same
-journal token. Access tokens are HMAC-signed, last an hour and are bound to this server's canonical
-resource URI; refresh tokens are opaque, stored hashed, and rotated on every use.
+document), and send the user to `/oauth/authorize`. Consent requires an existing browser session —
+an anonymous visitor is sent to `/login` first — so the journal token is only ever typed into a page
+the user navigated to themselves, never into one a client linked them to. The consent screen names
+the host the authorization code would be sent to. Access tokens are HMAC-signed, last an hour and
+are bound to this server's canonical resource URI; refresh tokens are opaque, stored hashed, and
+rotated on every use, and replaying a rotated one revokes the whole chain.
 
 The web UI uses the same tokens: open the Worker in a browser and enter one at `/login`.
 
@@ -84,14 +91,20 @@ The web UI uses the same tokens: open the Worker in a browser and enter one at `
 | --- | --- | --- |
 | `JOURNAL_TOKENS` | secret | JSON array of `{ label, token, project? }` |
 | `JOURNAL_TOKEN` | secret | single-token shorthand; label defaults to `default` |
-| `SESSION_SECRET` | secret | HMAC key for session cookies, CSRF tokens and access tokens |
+| `SESSION_SECRET` | secret | HMAC root key; session cookies, CSRF tokens and access tokens each sign under their own derived subkey |
+| `PUBLIC_ORIGIN` | var (optional) | canonical `https://host`; pins the OAuth issuer and audience instead of deriving them from the request |
 | `JOURNAL_TZ` | var | IANA zone for `local_date` and rendered titles (default `Europe/Berlin`) |
 | `DB` | D1 binding | storage |
-| `LOGIN_LIMITER` | rate limit binding | per-IP budget for *failed* logins and token exchanges |
+| `LOGIN_LIMITER` | rate limit binding | per-IP budget for *failed* credential attempts — the login form, bearer tokens on `/mcp`, token exchanges, and client registration once many clients exist |
 
 `entries.client_label` records which token wrote an entry, so a single client can be revoked by
 removing it from `JOURNAL_TOKENS` without disturbing the others — that also invalidates any web
 sessions and access tokens issued to it.
+
+Without the `LOGIN_LIMITER` binding nothing is throttled; the Worker logs a warning once and keeps
+serving, so a deployment that drops the binding stays usable but louder. Changing `SESSION_SECRET`
+invalidates every session cookie and access token at once, which is the fastest way to sign
+everything out.
 
 ### Project scoping
 
@@ -130,4 +143,6 @@ path.
   directories stay readable through the stdio server. There is no bulk-write surface at all.
 - No editing through the UI — the journal stays a model-authored record. Entries can be read and
   deleted.
-- No multi-user accounts, roles or per-entry sharing.
+- No multi-user accounts, roles or per-entry sharing. Labels are not a boundary: every configured
+  token can read, search and delete **every** entry, including ones written under another label or
+  another project slug. `project` is a filing default, not an access control.
