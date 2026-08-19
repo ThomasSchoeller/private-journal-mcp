@@ -1,0 +1,31 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "private-journal",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "vars": {
+    // IANA timezone used to derive `local_date` and to render titles.
+    "JOURNAL_TZ": "Europe/Berlin"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "private-journal",
+      // Replace with the id printed by `wrangler d1 create private-journal`.
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "ratelimits": [
+    {
+      "name": "LOGIN_LIMITER",
+      "namespace_id": "1001",
+      "simple": { "limit": 10, "period": 60 }
+    }
+  ]
+  // Secrets (never in this file):
+  //   wrangler secret put JOURNAL_TOKENS   (or JOURNAL_TOKEN)
+  //   wrangler secret put SESSION_SECRET
+}

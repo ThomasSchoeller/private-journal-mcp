@@ -72,6 +72,30 @@ The server provides comprehensive journaling and search capabilities through the
 - **Automatic Indexing**: Embeddings generated automatically for all entries on first startup and ongoing writes
 - **Privacy First**: All processing happens locally, no data leaves your machine
 
+## Cloudflare Worker Deployment
+
+`worker/` holds an optional remote deployment of this server (Hono + D1 + `@modelcontextprotocol/server`),
+self-contained with its own `package.json`. The root package is untouched by it.
+
+```bash
+cd worker
+npm test          # Miniflare worker tests + the Node parity test
+npm run typecheck
+npm run dev       # local Worker against a local D1
+npm run deploy    # wrangler deploy
+```
+
+**Key points when working in `worker/`:**
+- `src/store.ts` is the only module that writes SQL; `src/search.ts` builds FTS5 queries and ranking
+  as pure functions. Keep that split — it is what would let a vector backend be added later.
+- `src/entry.ts` re-implements the pure formatting logic of `src/journal.ts` (no Node imports so it
+  runs on Workers). `test-node/parity.test.ts` asserts both render identical markdown, so changing
+  one means changing the other.
+- Tool names, descriptions and argument shapes must stay identical to `src/server.ts`.
+- Entries are addressed by ULID, not by path; `local_date` and titles are derived in `JOURNAL_TZ`.
+- The UI ships no JavaScript, which is what lets the CSP set `script-src 'none'`. Entry bodies are
+  model-authored: escape first, then add markup (`src/ui/markdown.ts`).
+
 ## Testing Approach
 
 - Uses Jest with ts-jest preset and mocked transformers library for embedding tests

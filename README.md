@@ -149,6 +149,35 @@ I'm excited about this new search feature...
 Vector embeddings provide semantic understanding...
 ```
 
+## Remote deployment (Cloudflare Workers)
+
+The server can also run as a **remote MCP server** on Cloudflare Workers, storing entries in D1 so
+one journal is shared across every machine and agent session that holds a token. The same Worker
+serves a small web UI for browsing, searching and deleting entries.
+
+```bash
+cd worker && npm install
+npx wrangler d1 create private-journal        # paste the id into wrangler.jsonc
+npx wrangler d1 migrations apply private-journal --remote
+npx wrangler secret put JOURNAL_TOKENS
+npx wrangler secret put SESSION_SECRET
+npm run deploy
+```
+
+```bash
+claude mcp add --transport http journal https://<worker>.workers.dev/mcp \
+  --header "Authorization: Bearer <token>"
+```
+
+The tools are identical to the local ones, with two differences that follow from there being no
+filesystem: `read_journal_entry` takes the entry id from a search or list result rather than a path,
+and search is keyword-based (SQLite FTS5) rather than semantic. `process_thoughts` gains an optional
+`project` argument, since a Worker has no working directory to infer the project scope from.
+
+This is additive: the local stdio server is unchanged and keeps using the filesystem. See
+[`worker/README.md`](worker/README.md) for the full runbook and
+[`docs/cloudflare-worker-spec.md`](docs/cloudflare-worker-spec.md) for the design.
+
 ## Development
 
 ### Building

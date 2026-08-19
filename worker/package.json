@@ -1,0 +1,30 @@
+{
+  "name": "private-journal-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run && vitest run --config vitest.node.config.ts",
+    "test:worker": "vitest run",
+    "test:parity": "vitest run --config vitest.node.config.ts",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "migrate:local": "wrangler d1 migrations apply private-journal --local",
+    "migrate:remote": "wrangler d1 migrations apply private-journal --remote"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.0.0",
+    "hono": "^4.13.3",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "@cloudflare/workers-types": "^5.20260818.1",
+    "@types/node": "^26.2.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.124.0"
+  }
+}
